@@ -101,8 +101,9 @@
 - `KSKILL_PROXY_RATE_LIMIT_WINDOW_MS` — 기본 `60000`
 - `KSKILL_PROXY_RATE_LIMIT_MAX` — 기본 `60`
 - `KSKILL_PROXY_RATE_LIMIT_MAX_CLIENTS` — 메모리에 유지할 client rate-limit bucket 상한, 기본 `10000`
-- `KSKILL_PROXY_TRUST_PROXY_HOPS` — Fastify가 신뢰할 reverse-proxy hop 수, 애플리케이션 기본값 `0`. gpu01 production 배포에서만 배포 스크립트가 누락된 값을 `1`로 추가한다. staging·로컬·다른 호스트와 직접 노출되는 서버에는 이 production 기본값을 적용하지 않는다. hops가 1 이상이면 rate limiter는 `CF-Connecting-IP`를 `X-Forwarded-For`보다 우선한다.
+- `KSKILL_PROXY_TRUST_PROXY_HOPS` — Fastify가 신뢰할 reverse-proxy hop 수, 애플리케이션 기본값 `0`. Cloud Run production은 Google front end 한 hop이므로 `1`로 설정한다. 직접 노출되는 서버에는 0이 아닌 값을 쓰지 않는다. rate limiter는 `request.ip`만 사용하며 `CF-Connecting-IP`는 클라이언트가 위조할 수 있어 신뢰하지 않는다.
 - `DATA_GO_KR_API_KEY` - 공공데이터포털 에서 쓰이는 API 인증키 (`household-waste`, `parking-lots`, `ev-charger/*`, `building-register/title`, `real-estate`, `nts-business`, `mfds-drug-safety`, `mfds-food-safety`, `lh-notice`, `nhis/*`, `kr-whois/*`). 각 서비스는 공공데이터포털에서 별도 "활용신청" 승인이 필요하다. 키를 발급받은 뒤에는 [LH 임대공고문 정보](https://www.data.go.kr/data/15058530/openapi.do), [국민건강보험공단 장기요양기관 검색 서비스](https://www.data.go.kr/data/15059029/openapi.do), [국민건강보험공단 검진기관 찾기 조회](https://www.data.go.kr/data/15154419/openapi.do), WHOIS 도메인/IP 정보 API(서비스 `15094277`) 페이지에서도 활용신청을 눌러 동일 키를 활성화해야 해당 라우트가 성공한다. EV 데이터셋 `15076352`와 건축물대장 데이터셋 `15134735`는 자동승인 대상이지만 각각 별도 신청해야 한다. 미활성 상태에서는 upstream이 HTTP 401/403 또는 data.go.kr 인증 오류 XML을 돌려주고 proxy는 upstream error로 변환한다.
+- `HRFCO_RELAY_URL`, `HRFCO_RELAY_TOKEN` — 선택. 설정하면 `han-river/water-level`이 `api.hrfco.go.kr` 대신 이 릴레이(`infra/hrfco-relay`)로 요청한다. `api.hrfco.go.kr`이 Google Cloud egress를 차단하기 때문에 Cloud Run production에서 사용한다. URL만 있고 토큰이 없으면 503을 반환한다.
 
 기본 정책은 **무료 API 공개 프록시 = 무인증** 이다. 대신 endpoint scope 를 좁게 유지하고, cache + rate limit 으로 남용을 늦춘다.
 
@@ -361,9 +362,9 @@ curl -fsS --get "${LOCAL_PROXY_BASE_URL}/v1/kakao-local/geocode" \
 
 ## 프로덕션 배포
 
-프로덕션 프록시는 **gpu01**의 systemd user service로 운영되며, Cloudflare Tunnel을 통해 `k-skill-proxy.nomadamas.org`에 노출됩니다.
+프로덕션 프록시는 **Google Cloud Run**(`asia-northeast1`)에서 운영되며, Cloud Run 도메인 매핑으로 `k-skill-proxy.nomadamas.org`에 노출됩니다.
 
-- 자동 배포: gpu01 cron이 `origin/main`을 감지해 테스트, 백업, systemd 재시작, local/public `/health` smoke test를 수행합니다.
-- 배포 스크립트: `scripts/deploy-k-skill-proxy-gpu01.sh`
-- 시크릿: gpu01의 app `.env` 파일에서 systemd runtime에 주입됩니다.
+- 자동 배포: `main`에 머지되면 GitHub Actions가 테스트, 이미지 빌드, 후보 리비전 smoke test, 트래픽 전환, public `/health` smoke test를 수행하고 실패 시 이전 리비전으로 롤백합니다.
+- 배포 워크플로: `.github/workflows/deploy-k-skill-proxy.yml`
+- 시크릿: Google Secret Manager(`kskill-*`)에서 Cloud Run runtime에 주입됩니다.
 - 운영자 셋업, 키 회전, 상태 확인, rollback 절차는 [`docs/deploy-k-skill-proxy.md`](../../docs/deploy-k-skill-proxy.md) 참고.

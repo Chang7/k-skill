@@ -18,6 +18,7 @@ ENV NODE_ENV=production \
 COPY --from=deps /workspace/node_modules ./node_modules
 COPY packages/k-skill-proxy/package.json ./packages/k-skill-proxy/package.json
 COPY packages/k-skill-proxy/src ./packages/k-skill-proxy/src
+COPY packages/k-skill-proxy/privacy-policy.html ./packages/k-skill-proxy/privacy-policy.html
 COPY packages/parking-lot-search/src ./packages/parking-lot-search/src
 COPY packages/parking-lot-search/package.json ./packages/parking-lot-search/package.json
 WORKDIR /workspace/packages/k-skill-proxy
