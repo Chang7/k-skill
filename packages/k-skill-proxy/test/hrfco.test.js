@@ -119,3 +119,47 @@ test("fetchWaterLevelReport uses station info lookup before latest measurement l
     "list/10M/1018683.json"
   ]);
 });
+
+test("fetchWaterLevelReport routes through the relay with a bearer token when relayUrl is set", async () => {
+  const calls = [];
+  const report = await fetchWaterLevelReport({
+    stationCode: "1018683",
+    serviceKey: "test-key",
+    relayUrl: "https://relay.example.test/hrfco/",
+    relayToken: "relay-secret",
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), authorization: options.headers.authorization });
+      const content = String(url).endsWith("/waterlevel/info.json") ? stationItems : measurementItems;
+      return new Response(JSON.stringify({ content }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  });
+
+  assert.equal(report.station_name, "한강대교");
+  assert.deepEqual(calls, [
+    {
+      url: "https://relay.example.test/hrfco/test-key/waterlevel/info.json",
+      authorization: "Bearer relay-secret"
+    },
+    {
+      url: "https://relay.example.test/hrfco/test-key/waterlevel/list/10M/1018683.json",
+      authorization: "Bearer relay-secret"
+    }
+  ]);
+});
+
+test("fetchWaterLevelReport refuses to call a relay without a token and never hits upstream", async () => {
+  let called = false;
+  await assert.rejects(
+    fetchWaterLevelReport({
+      stationCode: "1018683",
+      serviceKey: "test-key",
+      relayUrl: "https://relay.example.test",
+      fetchImpl: async () => { called = true; return new Response("{}"); }
+    }),
+    (error) => error.code === "upstream_not_configured" && error.statusCode === 503
+  );
+  assert.equal(called, false);
+});

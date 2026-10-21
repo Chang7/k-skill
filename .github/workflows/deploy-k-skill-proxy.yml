@@ -1,0 +1,103 @@
+name: Deploy k-skill-proxy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/k-skill-proxy/**"
+      - "packages/parking-lot-search/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".dockerignore"
+      - ".github/workflows/deploy-k-skill-proxy.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-k-skill-proxy
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: k-skill
+  GCP_REGION: asia-northeast1
+  SERVICE: k-skill-proxy
+  IMAGE_REPO: asia-northeast3-docker.pkg.dev/k-skill/k-skill/k-skill-proxy
+  PUBLIC_URL: https://k-skill-proxy.nomadamas.org
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint --workspace k-skill-proxy
+      - run: npm run test --workspace k-skill-proxy
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/416293459081/locations/global/workloadIdentityPools/github/providers/github-oidc
+          service_account: k-skill-deployer@k-skill.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push image
+        run: |
+          gcloud auth configure-docker asia-northeast3-docker.pkg.dev --quiet
+          docker build -f packages/k-skill-proxy/Dockerfile -t "$IMAGE_REPO:$GITHUB_SHA" .
+          docker push "$IMAGE_REPO:$GITHUB_SHA"
+
+      - name: Deploy revision without traffic
+        run: |
+          # Env vars and Secret Manager bindings are kept from the existing service
+          # configuration; this workflow only replaces the image.
+          previous=$(gcloud run services describe "$SERVICE" --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --format=json | jq -r '.status.traffic[] | select(.percent == 100) | .revisionName')
+          test -n "$previous"
+          echo "PREVIOUS_REVISION=$previous" >> "$GITHUB_ENV"
+          gcloud run deploy "$SERVICE" \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --image "$IMAGE_REPO:$GITHUB_SHA" \
+            --no-traffic --tag "sha-${GITHUB_SHA::12}" --quiet
+
+      - name: Smoke test candidate revision
+        run: |
+          url=$(gcloud run services describe "$SERVICE" --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --format=json | jq -r --arg tag "sha-${GITHUB_SHA::12}" '.status.traffic[] | select(.tag == $tag) | .url')
+          test -n "$url"
+          for path in /health /privacy; do
+            curl -fsS --retry 5 --retry-delay 3 --retry-all-errors -o /dev/null "$url$path"
+          done
+
+      - name: Promote candidate
+        run: |
+          gcloud run services update-traffic "$SERVICE" \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" --to-latest --quiet
+
+      - name: Smoke test public domain, roll back on failure
+        run: |
+          for path in /health /privacy; do
+            if ! curl -fsS --retry 5 --retry-delay 3 --retry-all-errors -o /dev/null "$PUBLIC_URL$path"; then
+              echo "::error::$PUBLIC_URL$path failed; rolling back to $PREVIOUS_REVISION"
+              gcloud run services update-traffic "$SERVICE" \
+                --project "$GCP_PROJECT" --region "$GCP_REGION" \
+                --to-revisions "$PREVIOUS_REVISION=100" --quiet
+              exit 1
+            fi
+          done
+
+      - name: Remove candidate tag
+        if: always()
+        run: |
+          gcloud run services update-traffic "$SERVICE" \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --remove-tags "sha-${GITHUB_SHA::12}" --quiet || true

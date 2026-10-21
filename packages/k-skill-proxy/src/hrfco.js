@@ -186,8 +186,9 @@ function buildWaterLevelReport({ stationItems, measurementItems, stationName = n
   };
 }
 
-async function fetchJson(url, { fetchImpl = global.fetch } = {}) {
+async function fetchJson(url, { fetchImpl = global.fetch, headers = {} } = {}) {
   const response = await fetchImpl(url, {
+    headers,
     signal: AbortSignal.timeout(20000)
   });
 
@@ -202,25 +203,53 @@ async function fetchJson(url, { fetchImpl = global.fetch } = {}) {
   return response.json();
 }
 
-async function fetchWaterLevelStations({ serviceKey, fetchImpl = global.fetch }) {
-  const url = new URL(`${HRFCO_API_BASE_URL}/${serviceKey}/waterlevel/info.json`);
-  const payload = await fetchJson(url, { fetchImpl });
+function resolveHrfcoTransport({ relayUrl = null, relayToken = null } = {}) {
+  if (!relayUrl) {
+    return { baseUrl: HRFCO_API_BASE_URL, headers: {} };
+  }
+  if (!relayToken) {
+    throw buildError({
+      message: "HRFCO_RELAY_TOKEN is required when HRFCO_RELAY_URL is set.",
+      statusCode: 503,
+      code: "upstream_not_configured"
+    });
+  }
+  return {
+    baseUrl: String(relayUrl).replace(/\/+$/, ""),
+    headers: { authorization: `Bearer ${relayToken}` }
+  };
+}
+
+async function fetchWaterLevelStations({ serviceKey, fetchImpl = global.fetch, relayUrl = null, relayToken = null }) {
+  const { baseUrl, headers } = resolveHrfcoTransport({ relayUrl, relayToken });
+  const url = new URL(`${baseUrl}/${serviceKey}/waterlevel/info.json`);
+  const payload = await fetchJson(url, { fetchImpl, headers });
   return Array.isArray(payload.content) ? payload.content : [];
 }
 
-async function fetchLatestWaterLevel({ serviceKey, stationCode, fetchImpl = global.fetch }) {
-  const url = new URL(`${HRFCO_API_BASE_URL}/${serviceKey}/waterlevel/list/10M/${stationCode}.json`);
-  const payload = await fetchJson(url, { fetchImpl });
+async function fetchLatestWaterLevel({ serviceKey, stationCode, fetchImpl = global.fetch, relayUrl = null, relayToken = null }) {
+  const { baseUrl, headers } = resolveHrfcoTransport({ relayUrl, relayToken });
+  const url = new URL(`${baseUrl}/${serviceKey}/waterlevel/list/10M/${stationCode}.json`);
+  const payload = await fetchJson(url, { fetchImpl, headers });
   return Array.isArray(payload.content) ? payload.content : [];
 }
 
-async function fetchWaterLevelReport({ stationName = null, stationCode = null, serviceKey, fetchImpl = global.fetch }) {
-  const stations = await fetchWaterLevelStations({ serviceKey, fetchImpl });
+async function fetchWaterLevelReport({
+  stationName = null,
+  stationCode = null,
+  serviceKey,
+  fetchImpl = global.fetch,
+  relayUrl = null,
+  relayToken = null
+}) {
+  const stations = await fetchWaterLevelStations({ serviceKey, fetchImpl, relayUrl, relayToken });
   const station = pickWaterLevelStation(stations, { stationName, stationCode });
   const measurements = await fetchLatestWaterLevel({
     serviceKey,
     stationCode: station.wlobscd,
-    fetchImpl
+    fetchImpl,
+    relayUrl,
+    relayToken
   });
 
   return buildWaterLevelReport({

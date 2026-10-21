@@ -1,0 +1,13 @@
+{
+  "name": "k-skill-hrfco-relay",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Authenticated relay for api.hrfco.go.kr, which blocks Google Cloud egress",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/server.test.js"
+  }
+}
