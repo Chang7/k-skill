@@ -254,6 +254,8 @@ function buildConfig(env = process.env) {
     kmaOpenApiKey: trimOrNull(env.KMA_OPEN_API_KEY),
     seoulOpenApiKey: trimOrNull(env.SEOUL_OPEN_API_KEY),
     hrfcoApiKey: trimOrNull(env.HRFCO_OPEN_API_KEY),
+    hrfcoRelayUrl: trimOrNull(env.HRFCO_RELAY_URL),
+    hrfcoRelayToken: trimOrNull(env.HRFCO_RELAY_TOKEN),
     opinetApiKey: trimOrNull(env.OPINET_API_KEY),
     molitApiKey: trimOrNull(env.DATA_GO_KR_API_KEY),
     evChargerApiKey: trimOrNull(env.DATA_GO_KR_API_KEY),
@@ -441,13 +443,7 @@ function createMemoryCache({
   };
 }
 
-function clientRateLimitKey(request, config) {
-  if (config.trustProxyHops > 0) {
-    const cfConnectingIp = request.headers["cf-connecting-ip"];
-    if (typeof cfConnectingIp === "string" && cfConnectingIp.trim()) {
-      return cfConnectingIp.trim();
-    }
-  }
+function clientRateLimitKey(request) {
   return request.ip || "unknown";
 }
 
@@ -478,7 +474,7 @@ function buildRateLimiter(config, { now = Date.now } = {}) {
       return true;
     }
 
-    const key = clientRateLimitKey(request, config);
+    const key = clientRateLimitKey(request);
     const currentTime = now();
     const current = state.get(key);
 
@@ -2023,6 +2019,8 @@ async function proxyHrfcoWaterLevelRequest({
   stationName = null,
   stationCode = null,
   apiKey,
+  relayUrl = null,
+  relayToken = null,
   fetchImpl = global.fetch
 }) {
   if (!apiKey) {
@@ -2041,6 +2039,8 @@ async function proxyHrfcoWaterLevelRequest({
       stationName,
       stationCode,
       serviceKey: apiKey,
+      relayUrl,
+      relayToken,
       fetchImpl
     });
 
@@ -3502,7 +3502,9 @@ function buildServer({ env = process.env, provider = null, now = () => new Date(
 
     const upstream = await proxyHrfcoWaterLevelRequest({
       ...normalized,
-      apiKey: config.hrfcoApiKey
+      apiKey: config.hrfcoApiKey,
+      relayUrl: config.hrfcoRelayUrl,
+      relayToken: config.hrfcoRelayToken
     });
 
     reply.code(upstream.statusCode);

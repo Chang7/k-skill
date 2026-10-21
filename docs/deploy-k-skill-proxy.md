@@ -1,124 +1,105 @@
-# k-skill-proxy deployment (gpu01 + systemd)
+# k-skill-proxy deployment (Google Cloud Run)
 
-`k-skill-proxy` production runs on `gpu01`, not Google Cloud Run. The public
-domain is served by a Cloudflare Tunnel that forwards to the Fastify process on
-`127.0.0.1:8080`.
+`k-skill-proxy` production runs on Google Cloud Run (project `k-skill`, region
+`asia-northeast1`, service `k-skill-proxy`). The public domain
+`k-skill-proxy.nomadamas.org` is a Cloud Run domain mapping: a DNS-only
+Cloudflare `CNAME` to `ghs.googlehosted.com`. Cloud Run domain mappings are not
+available in `asia-northeast3`, which is why the service lives in Tokyo.
 
 ## Production layout
 
 | Item | Value |
 | --- | --- |
-| Host | `gpu01` (`gpu01.nomadamas.org`; `hostname -s` is `marker-multi-gpu-server-01`) |
+| Platform | Cloud Run (min instances 0, max 5, 1 vCPU, 512Mi; cold starts are accepted) |
+| GCP project | `k-skill` (number `416293459081`) |
+| Service / region | `k-skill-proxy` / `asia-northeast1` |
 | Public URL | `https://k-skill-proxy.nomadamas.org` |
-| App directory | `/data/home/jeffrey/apps/k-skill-proxy` |
-| Source checkout | `/data/home/jeffrey/apps/k-skill-proxy-repo` |
-| Service | `systemctl --user status k-skill-proxy.service` |
-| Tunnel | `systemctl --user status k-skill-proxy-tunnel.service` |
-| Runtime env | `/data/home/jeffrey/apps/k-skill-proxy/.env` |
-| Deployed revision | `/data/home/jeffrey/apps/k-skill-proxy/deployed-sha` |
-| Deploy script | `scripts/deploy-k-skill-proxy-gpu01.sh` |
-
-The production listener is bound to `127.0.0.1` and receives public traffic through exactly one local Cloudflare Tunnel hop. Only when the gpu01 deployment script is running with `KSKILL_PROXY_DEPLOY_ENVIRONMENT=production` and a production host (`KSKILL_PROXY_DEPLOY_HOST=gpu01`, or `hostname -s` of `gpu01` / `marker-multi-gpu-server-01`) does it ensure the runtime env contains `KSKILL_PROXY_TRUST_PROXY_HOPS=1` before restarting the service. Cron should set `KSKILL_PROXY_DEPLOY_HOST=gpu01` explicitly. Non-production or non-gpu01 executions leave the application default at `0`. An explicit operator value is preserved, and `KSKILL_PROXY_ENV_FILE` may point the script at a non-default runtime env path.
-
-Do not use this setting for a directly exposed listener. Trusting one hop is safe here because the Fastify port is loopback-only; making that port externally reachable would allow clients to supply a forged `X-Forwarded-For` value.
+| Image | `asia-northeast3-docker.pkg.dev/k-skill/k-skill/k-skill-proxy:<git sha>` |
+| Secrets | Secret Manager `kskill-<env-name>` (e.g. `kskill-data-go-kr-api-key`), bound as env vars |
+| Non-secret env | `KSKILL_PROXY_*` and `BCCARD_EATPL_INST_NM` on the service |
+| Deploy workflow | `.github/workflows/deploy-k-skill-proxy.yml` |
+| Deploy identity | `k-skill-deployer@k-skill.iam.gserviceaccount.com` via Workload Identity Federation |
+| Runtime identity | default Compute service account (`secretmanager.secretAccessor`) |
 
 ## Automatic deployment
 
-The `gpu01` user crontab runs the deployment script every five minutes under
-`flock`. The script fetches `origin/main`, exits when the recorded SHA already
-matches, and otherwise:
+Every push to `main` that touches `packages/k-skill-proxy/**`,
+`packages/parking-lot-search/**`, the root `package*.json`, `.dockerignore`, or
+the workflow itself runs `.github/workflows/deploy-k-skill-proxy.yml`:
 
-1. checks out the target SHA in the source checkout;
-2. runs `npm ci`, proxy lint, and all proxy tests;
-3. creates a timestamped backup of the current app;
-4. syncs the proxy and its local workspace dependency;
-5. installs production dependencies and restarts the systemd user service;
-6. checks local and public `/health` and `/privacy`;
-7. records `deployed-sha` only after all checks pass.
+1. `npm ci`, proxy lint, and all proxy tests;
+2. authenticate to GCP with Workload Identity Federation (no stored keys; the
+   provider only accepts `NomaDamas/k-skill` on `refs/heads/main`);
+3. build the Dockerfile on the runner and push `:<sha>` to Artifact Registry;
+4. `gcloud run deploy --no-traffic --tag sha-<12>` so the new revision gets no
+   traffic yet;
+5. smoke-test the tagged revision URL (`/health`, `/privacy`);
+6. move 100% of traffic to the new revision;
+7. smoke-test the public domain; on failure traffic is moved back to the
+   previous revision and the job fails.
 
-Any failure after the backup performs an automatic rollback by restoring the
-previous files and restarting the old service. A `main` merge is therefore deployed within the cron interval when the
-new proxy tests and smoke checks pass.
+The workflow replaces only the image. Env vars and secret bindings stay as
+configured on the service, so adding a new secret is a one-time operator step
+(see below) done before the code that needs it is merged.
 
-### Service watchdog
-
-Every cron run — including runs that exit early because `deployed-sha` already
-matches — first ensures the production services are active before anything
-else. If any of them is installed but not active, the script starts it. This
-exists because the 2026-08-29 gpu01 reboot left the Cloudflare tunnel and the
-Loki/Grafana/Promtail dashboard stack dead for ~10 days: their units used
-`Restart=on-failure`, which does not revive a clean SIGTERM, and nothing else
-ever started them. The proxy only survived because this same cron happens to
-`restart` it on every run.
-
-Watched services (production gpu01 only, overridable via
-`KSKILL_PROXY_WATCHED_SERVICES`):
-
-| Service | Role |
-| --- | --- |
-| `k-skill-proxy.service` | Fastify proxy |
-| `k-skill-proxy-tunnel.service` | cloudflared tunnel for both public hostnames |
-| `k-skill-proxy-loki.service` | log store |
-| `k-skill-proxy-promtail.service` | log shipper |
-| `k-skill-proxy-grafana.service` | dashboard UI |
-
-All five units use `Restart=always` with `StartLimitIntervalSec=0` so a clean
-stop or repeated failure never disables restart permanently. The canonical
-unit files live in the repo:
-
-| Unit | Repo source |
-| --- | --- |
-| proxy | `infra/k-skill-proxy-dashboard/systemd/k-skill-proxy.service` |
-| tunnel | `infra/k-skill-proxy-dashboard/systemd/k-skill-proxy-tunnel.service` |
-| loki / promtail / grafana | `infra/k-skill-proxy-dashboard/systemd/` |
-
-The tunnel unit also carries `RequiresMountsFor=` on the cloudflared binary,
-its config, and the app directory, because all three live on the `gpu02:/data`
-NFS mount and must not be exec'd before the mount is up at boot.
-
-Install or repair the cron entry:
-
-```cron
-*/5 * * * * KSKILL_PROXY_DEPLOY_HOST=gpu01 flock -n /tmp/k-skill-proxy-deploy.lock /data/home/jeffrey/apps/k-skill-proxy/deploy-k-skill-proxy-gpu01.sh >> /data/home/jeffrey/apps/k-skill-proxy/deploy.log 2>&1
-```
-
-The SSH alias is `gpu01`, but `hostname -s` on the box is `marker-multi-gpu-server-01`. The deploy script treats both as production; still set `KSKILL_PROXY_DEPLOY_HOST=gpu01` in cron so a hostname change cannot silently disable the watchdog. After the first `main` deploy that includes this script, it copies itself onto `$APP_DIR/deploy-k-skill-proxy-gpu01.sh`. Until then, install it once:
-
-```bash
-install -m 0755 /data/home/jeffrey/apps/k-skill-proxy-repo/scripts/deploy-k-skill-proxy-gpu01.sh \
-  /data/home/jeffrey/apps/k-skill-proxy/deploy-k-skill-proxy-gpu01.sh
-```
+Deploys are serialized with a `concurrency` group and never cancelled midway.
 
 ## Manual operation
 
 ```bash
-mosh gpu01
-/data/home/jeffrey/apps/k-skill-proxy/deploy-k-skill-proxy-gpu01.sh
-curl -fsS http://127.0.0.1:8080/health
+gcloud config configurations activate kskill   # account vkehfdl1@gmail.com, project k-skill
+gcloud run services describe k-skill-proxy --region asia-northeast1
+gcloud run revisions list --service k-skill-proxy --region asia-northeast1
+gcloud beta run domain-mappings describe --domain k-skill-proxy.nomadamas.org --region asia-northeast1
 curl -fsS https://k-skill-proxy.nomadamas.org/health
-curl -fsS http://127.0.0.1:8080/privacy
 curl -fsS https://k-skill-proxy.nomadamas.org/privacy
-cat /data/home/jeffrey/apps/k-skill-proxy/deployed-sha
 ```
 
-Logs and service state:
+Logs (pino JSON, one `route usage` line per request):
 
 ```bash
-tail -f /data/home/jeffrey/apps/k-skill-proxy/deploy.log
-tail -f /data/home/jeffrey/apps/k-skill-proxy/proxy.log
-systemctl --user status k-skill-proxy.service
-systemctl --user status k-skill-proxy-tunnel.service
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="k-skill-proxy"' \
+  --limit 50 --freshness=1h --format='value(textPayload,jsonPayload.route,jsonPayload.statusCode)'
 ```
 
-Verify the trust-proxy setting without printing the rest of the secret-bearing env file:
+Rollback (instant, no rebuild):
 
 ```bash
-grep '^KSKILL_PROXY_TRUST_PROXY_HOPS=' /data/home/jeffrey/apps/k-skill-proxy/.env
+gcloud run services update-traffic k-skill-proxy --region asia-northeast1 \
+  --to-revisions <previous-revision>=100
 ```
 
-The expected production value is `KSKILL_PROXY_TRUST_PROXY_HOPS=1`. If the key is missing, the next gpu01 production deployment adds it and restarts the service. Staging, local, and other-host executions do not add it. If the topology changes, update the explicit value only after recounting the trusted reverse-proxy hops.
+Manual build and deploy, when the workflow cannot run:
 
-The `.env` file stays on `gpu01` and must not be copied into the repository.
+```bash
+docker build -f packages/k-skill-proxy/Dockerfile -t asia-northeast3-docker.pkg.dev/k-skill/k-skill/k-skill-proxy:manual .
+docker push asia-northeast3-docker.pkg.dev/k-skill/k-skill/k-skill-proxy:manual
+gcloud run deploy k-skill-proxy --region asia-northeast1 \
+  --image asia-northeast3-docker.pkg.dev/k-skill/k-skill/k-skill-proxy:manual
+```
+
+### Domain and certificate
+
+The `k-skill-proxy` record in Cloudflare must stay **DNS only** (grey cloud)
+and point to `ghs.googlehosted.com`. A proxied (orange) record blocks Google
+certificate issuance. After a new mapping, the certificate usually becomes
+`Ready` within about an hour and the Google front end can need a few more
+minutes before TLS handshakes succeed; expect transient TLS errors until then.
+
+## Client IP and rate limiting
+
+Cloud Run puts one Google front end in front of the container, so production
+sets `KSKILL_PROXY_TRUST_PROXY_HOPS=1` and Fastify takes `request.ip` from the
+`X-Forwarded-For` entry that front end appends. The rate limiter keys on
+`request.ip` only. It deliberately does **not** read `CF-Connecting-IP`: the
+traffic no longer passes through Cloudflare, so any client could set that
+header and get a fresh rate-limit bucket per request.
+
+Do not raise the hop count without re-verifying: with a tagged no-traffic
+revision, send requests with forged `X-Forwarded-For` / `CF-Connecting-IP`
+values and confirm they still hit `429` once `KSKILL_PROXY_RATE_LIMIT_MAX` is
+exceeded.
+
 
 ## Upstream connectivity triage
 
@@ -151,8 +132,8 @@ done
 timeout 12 curl -sS -o /dev/null -w "odcloud %{http_code}\n" "https://api.odcloud.kr/"
 
 # 3. Confirm the proxy itself is up and the upstream flags are on.
-curl -fsS http://127.0.0.1:8080/health
 curl -fsS https://k-skill-proxy.nomadamas.org/health
+curl -fsS https://k-skill-proxy-416293459081.asia-northeast1.run.app/health   # bypasses DNS
 
 # 4. Re-run the failing routes and read upstream.cause.
 curl -sS --get "https://k-skill-proxy.nomadamas.org/v1/korea-weather/forecast" \
@@ -163,7 +144,8 @@ curl -sS --get "https://k-skill-proxy.nomadamas.org/v1/kosis/search" \
 
 Interpretation:
 
-- If the `27.101.0.0/16` hosts time out from both the Mac and gpu01 while a
+- If the `27.101.0.0/16` hosts time out from the Mac and from a Cloud Run job
+  (`gcloud run jobs execute` with a `fetch` probe) while a
   different-network upstream answers, the fault is on the path to that netblock
   (ISP routing or the upstream edge), not in the proxy. Report it and wait for
   the upstream; the proxy will keep answering `503 upstream_unreachable` /
@@ -174,24 +156,52 @@ Interpretation:
 - After the upstream recovers, re-run the commands above plus the `/health` and
   `/privacy` smoke tests.
 
-## Required runtime env (gpu01)
 
-Cloudflare Tunnel forwards to `127.0.0.1:8080`. Fastify must trust that one hop
-or every external client shares a single rate-limit bucket (`request.ip` becomes
-`127.0.0.1`). Keep these keys in `/data/home/jeffrey/apps/k-skill-proxy/.env`:
+## Required runtime env (Cloud Run)
+
+Secrets are stored in Secret Manager as `kskill-<env-name-lowercased-with-dashes>`
+and bound with `--set-secrets` / `--update-secrets`. Never put them in the
+repository, query strings, shell arguments, issues, or logs. Add or rotate one:
+
+```bash
+printf '%s' "$VALUE" | gcloud secrets versions add kskill-<name> --data-file=-   # existing
+printf '%s' "$VALUE" | gcloud secrets create kskill-<name> --data-file=- --replication-policy=automatic   # new
+gcloud run services update k-skill-proxy --region asia-northeast1 \
+  --update-secrets ENV_NAME=kskill-<name>:latest
+```
+
+Plain (non-secret) env on the service:
 
 ```dotenv
 KSKILL_PROXY_TRUST_PROXY_HOPS=1
 KSKILL_PROXY_RATE_LIMIT_WINDOW_MS=60000
-KSKILL_PROXY_RATE_LIMIT_MAX=60
-COUPANG_ACCESS_KEY=<coupang-partners-access-key>
-COUPANG_SECRET_KEY=<coupang-partners-secret-key>
-KOMSA_MTIS_API_KEY=<komsa-mtis-service-key>
+KSKILL_PROXY_RATE_LIMIT_MAX=180
+KSKILL_PROXY_CACHE_TTL_MS=300000
+KSKILL_PROXY_NAME=k-skill-proxy
+BCCARD_EATPL_INST_NM=<partner-institution-code>
+HRFCO_RELAY_URL=https://hrfco-relay.nomadamas.org
 ```
 
+`KSKILL_PROXY_TRUST_PROXY_HOPS=1` is required in production (see above). Leave
+it unset (default `0`) only for a locally bound process that is not behind a
+reverse proxy.
+
+Secret-backed keys currently bound: `AIR_KOREA_OPEN_API_KEY`,
+`BLUE_RIBBON_SESSION_ID`, `DATA4LIBRARY_AUTH_KEY`, `DATA_GO_KR_API_KEY`,
+`FOODSAFETYKOREA_API_KEY`, `HRFCO_OPEN_API_KEY`, `KAKAO_REST_API_KEY`,
+`KEDU_INFO_KEY`, `KMA_OPEN_API_KEY`, `KOSIS_API_KEY`, `KRX_API_KEY`, `LAW_OC`,
+`NAVER_SEARCH_CLIENT_ID`, `NAVER_SEARCH_CLIENT_SECRET`, `OPINET_API_KEY`,
+`SEOUL_OPEN_API_KEY`, `ASSEMBLY_API_KEY`, `KOPIS_API_KEY`, `KAMIS_API_KEY`,
+`KOMSA_MTIS_API_KEY`, `ASK_SEOUL_SKILL_API_BASE_URL`, `ASK_SEOUL_KSKILL_API_KEY`,
+`COUPANG_ACCESS_KEY`, `COUPANG_SECRET_KEY`, `BCCARD_EATPL_API_BASE_URL`,
+`BCCARD_EATPL_RELAY_URL`, `BCCARD_EATPL_RELAY_TOKEN`, `HRFCO_RELAY_TOKEN`.
+Verify activation through `/health` → `upstreams.*Configured`.
+
+The Coupang keys enable `GET /v1/coupang/products/search`;
+`KOMSA_MTIS_API_KEY` enables `GET /v1/komsa/ferry/:dataset`.
+
 Optional BC Card eat.pl relay keys, only when the Lightsail fixed-egress relay
-is in use. Store the same random token on Lightsail as `EATPL_RELAY_TOKEN`.
-Never put the token in Git, chat, or client requests:
+is in use. Store the same random token on Lightsail as `EATPL_RELAY_TOKEN`:
 
 ```dotenv
 BCCARD_EATPL_INST_NM=<partner-institution-code>
@@ -200,20 +210,43 @@ BCCARD_EATPL_RELAY_URL=https://eatpl-relay.nomadamas.org/v1/search
 BCCARD_EATPL_RELAY_TOKEN=<same-token-as-lightsail>
 ```
 
-`KSKILL_PROXY_TRUST_PROXY_HOPS=1` is required in production. Leave it unset
-(default `0`) only for a locally bound process that is not behind a reverse
-proxy. When hops are trusted, the rate limiter prefers `CF-Connecting-IP` over
-`X-Forwarded-For` so clients cannot spoof extra XFF entries.
+## HRFCO relay (Han River water level)
 
-The Coupang keys enable `GET /v1/coupang/products/search`. Store them only in
-the gpu01 runtime `.env`; never pass them in query strings, shell arguments,
-issues, or logs. Verify activation through
-`/health` → `upstreams.coupangConfigured=true`.
+`api.hrfco.go.kr` does not answer from Google Cloud egress (0/8 connects from
+both `asia-northeast1` and `asia-northeast3`), while it answers from gpu01.
+`GET /v1/han-river/water-level` therefore goes through a small authenticated
+relay that still runs on gpu01:
 
-`KOMSA_MTIS_API_KEY` enables `GET /v1/komsa/ferry/:dataset`. Store the value
-only in the gpu01 runtime `.env`; never pass it in query strings, shell
-arguments, issues, or logs. Verify activation through
-`/health` → `upstreams.komsaConfigured=true`, then exercise a read-only ferry lookup.
+```text
+Cloud Run --HTTPS + Bearer HRFCO_RELAY_TOKEN--> hrfco-relay.nomadamas.org
+  (Cloudflare Tunnel `k-skill-proxy`, ingress -> http://localhost:8090)
+  --> gpu01 k-skill-hrfco-relay.service --> https://api.hrfco.go.kr
+```
+
+| Item | Value |
+| --- | --- |
+| Source | `infra/hrfco-relay/server.js` (only `GET /<key>/waterlevel/info.json` and `/<key>/waterlevel/list/10M/<code>.json`) |
+| Unit | `infra/hrfco-relay/k-skill-hrfco-relay.service` (`systemctl --user status k-skill-hrfco-relay.service`) |
+| App directory | `/data/home/jeffrey/apps/k-skill-hrfco-relay` (`server.js`, `.env` mode 600 with `HRFCO_RELAY_TOKEN`, `HRFCO_RELAY_PORT=8090`) |
+| Tunnel | `k-skill-proxy-tunnel.service`, ingress `hrfco-relay.nomadamas.org -> http://localhost:8090` |
+| Token | Secret Manager `kskill-hrfco-relay-token`, bound as `HRFCO_RELAY_TOKEN` |
+
+Update the relay after changing `infra/hrfco-relay/server.js`:
+
+```bash
+scp infra/hrfco-relay/server.js gpu01:/data/home/jeffrey/apps/k-skill-hrfco-relay/server.js
+ssh gpu01 'systemctl --user restart k-skill-hrfco-relay.service'
+curl -fsS https://hrfco-relay.nomadamas.org/health
+```
+
+Rotate the token: write a new value to both gpu01 `.env` and
+`kskill-hrfco-relay-token` (new secret version), restart the relay, then
+redeploy or `gcloud run services update` the proxy so it reads `:latest`.
+
+The proxy is not the only thing still on gpu01: the Cloudflare Tunnel, the
+relay, and the Loki/Promtail/Grafana dashboard keep running there. The old
+proxy process, the deploy script, and its cron were retired.
+
 
 ## ASK Seoul weather-risk route handoff
 
@@ -226,7 +259,7 @@ Before deploying the `seoul-weather-risk` proxy route, ASK Seoul must issue a **
 | permitted Marketplace APIs | `GET /skill/v1/bundles/seoul-weather-risk`, `GET /skill/v1/products/weather_place_risk_window`, `GET /skill/v1/products/weather_place_risk_window/data` |
 | excluded APIs | every `/api/v1/*` API and every other `/skill/v1/*` product |
 
-Store only these two values in the existing gpu01 runtime `.env`:
+Store only these two values as Secret Manager secrets bound to the Cloud Run service (`ASK_SEOUL_SKILL_API_BASE_URL`, `ASK_SEOUL_KSKILL_API_KEY`):
 
 ```dotenv
 ASK_SEOUL_SKILL_API_BASE_URL=https://<ask-seoul-skill-origin>
@@ -235,11 +268,18 @@ ASK_SEOUL_KSKILL_API_KEY=<dedicated-service-key>
 
 The key is not a user credential: it is sent only from the proxy process to the fixed ASK Seoul `/skill/v1` paths. Do not deploy this route until the Marketplace has applied the service-key scope migration and registered this principal.
 
-Rotate the key by registering a replacement with the same scope, replacing only the gpu01 runtime secret, restarting/smoke-testing the proxy, and then revoking the old key. If the proxy is disabled or suspected compromised, revoke its key immediately; the Marketplace must deny it before any daily-quota accounting. Never paste a key into an issue, PR, shell argument, URL, or log.
+Rotate the key by registering a replacement with the same scope, adding a new Secret Manager version, redeploying/smoke-testing the proxy, and then revoking the old key. If the proxy is disabled or suspected compromised, revoke its key immediately; the Marketplace must deny it before any daily-quota accounting. Never paste a key into an issue, PR, shell argument, URL, or log.
 
 ## Usage stats dashboard
 
-Endpoint call statistics (`routeUsage` log lines) are collected into Loki by
+> **Currently not fed.** Promtail tails `/data/home/jeffrey/apps/k-skill-proxy/proxy.log`
+> on gpu01, which only the retired gpu01 proxy process wrote. The proxy now runs
+> on Cloud Run and logs `routeUsage` lines to Cloud Logging, so the Grafana
+> panels below stop updating until Promtail is pointed at a Cloud Logging
+> export. Until then query Cloud Logging directly, e.g.
+> `gcloud logging read 'resource.type="cloud_run_revision" AND jsonPayload.msg="route usage"' --format='value(jsonPayload.route,jsonPayload.statusCode)'`.
+
+Endpoint call statistics (`routeUsage` log lines) were collected into Loki by
 Promtail and visualized in Grafana at
 `https://k-skill-proxy-dashboard.nomadamas.org` (Grafana login required,
 admin credentials live in

@@ -78,14 +78,14 @@ These rules are repo-specific and apply to everything under this directory.
 ## Proxy server development
 
 - 개발 repo (`dev` 브랜치)에서 proxy 코드를 수정하고, main에 merge하면 프로덕션에 반영된다.
-- 프로덕션 배포 대상은 **gpu01**의 systemd user service이며, Cloudflare Tunnel을 통해 `k-skill-proxy.nomadamas.org`로 노출된다.
-- `main` 브랜치에 merge되면 gpu01 cron이 `origin/main`을 감지하고 테스트, 백업, 파일 동기화, systemd 재시작, local/public `/health` smoke test를 수행한다.
+- 프로덕션 배포 대상은 **Google Cloud Run** (`k-skill` 프로젝트, `asia-northeast1`, 서비스 `k-skill-proxy`, 최소 인스턴스 0)이며, Cloud Run 도메인 매핑(Cloudflare DNS-only CNAME → `ghs.googlehosted.com`)으로 `k-skill-proxy.nomadamas.org`에 노출된다.
+- `main` 브랜치에 merge되면 `.github/workflows/deploy-k-skill-proxy.yml`이 테스트, 이미지 빌드, no-traffic 리비전 배포, 후보 리비전 smoke test, 트래픽 전환, public `/health` smoke test를 수행하고 실패 시 이전 리비전으로 롤백한다.
 - 따라서 **dev에서 route를 추가/수정한 뒤 main에 merge되기 전까지는 프로덕션 proxy에 반영되지 않는다.**
 - proxy 서버 코드: `packages/k-skill-proxy/src/server.js`
-- 자동 배포 스크립트: `scripts/deploy-k-skill-proxy-gpu01.sh`
+- 자동 배포 워크플로: `.github/workflows/deploy-k-skill-proxy.yml` (Workload Identity Federation, 서비스 계정 `k-skill-deployer@k-skill.iam.gserviceaccount.com`)
 - proxy 서버 테스트: `packages/k-skill-proxy/test/server.test.js`
 - 로컬 테스트: `node packages/k-skill-proxy/src/server.js` (환경변수는 `~/.config/k-skill/secrets.env` 등에서 직접 export해서 띄운다)
-- 프로덕션 시크릿은 gpu01의 `/data/home/jeffrey/apps/k-skill-proxy/.env`에 보관되고 systemd가 주입한다.
+- 프로덕션 시크릿은 Google Secret Manager(`kskill-*`)에 보관되고 Cloud Run이 환경변수로 주입한다. `api.hrfco.go.kr`은 GCP egress를 차단하므로 한강 수위 라우트만 gpu01의 `infra/hrfco-relay`를 거친다.
 - **운영 관련 모든 절차는 [`docs/deploy-k-skill-proxy.md`](docs/deploy-k-skill-proxy.md)에 정리되어 있다.** 자동 배포, 상태 확인, 로그, 수동 배포, rollback 절차는 그 문서를 기준으로 한다.
 
 ## Large public file mirrors
