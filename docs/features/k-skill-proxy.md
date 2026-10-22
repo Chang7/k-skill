@@ -97,15 +97,14 @@ client/skill -> k-skill-proxy -> upstream public API
 
 ## 프로덕션 배포 구조
 
-프로덕션 proxy 서버는 **gpu01**에서 운영한다.
+프로덕션 proxy 서버는 **Google Cloud Run**에서 운영한다.
 
-- systemd user service: `k-skill-proxy.service`
-- tunnel service: `k-skill-proxy-tunnel.service`
+- Cloud Run 서비스: `k-skill-proxy` (프로젝트 `k-skill`, 리전 `asia-northeast1`, 최소 인스턴스 0)
 - 공개 도메인: `k-skill-proxy.nomadamas.org`
-- 자동 배포 스크립트: `scripts/deploy-k-skill-proxy-gpu01.sh`
-- 시크릿: gpu01 app directory의 `.env`에서 runtime에 주입
+- 자동 배포 워크플로: `.github/workflows/deploy-k-skill-proxy.yml`
+- 시크릿: Google Secret Manager(`kskill-*`)에서 runtime에 주입
 
-`main` 브랜치에 push/merge되면 gpu01 cron이 `origin/main`을 감지하고 테스트, 백업, 파일 동기화, systemd 재시작, local/public `/health` smoke test를 수행한다. 운영 절차와 rollback 방법은 [`docs/deploy-k-skill-proxy.md`](../deploy-k-skill-proxy.md)에 정리되어 있다.
+`main` 브랜치에 push/merge되면 GitHub Actions가 테스트, 이미지 빌드, no-traffic 리비전 배포, smoke test, 트래픽 전환, public `/health` smoke test를 수행하고 실패 시 이전 리비전으로 롤백한다. `api.hrfco.go.kr`은 GCP egress를 차단하므로 한강 수위 라우트만 gpu01의 릴레이(`infra/hrfco-relay`)를 거친다. 운영 절차와 rollback 방법은 [`docs/deploy-k-skill-proxy.md`](../deploy-k-skill-proxy.md)에 정리되어 있다.
 
 ## 기본 공개 정책
 

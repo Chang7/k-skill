@@ -1,6 +1,6 @@
 [Unit]
 Description=cloudflared tunnel for k-skill-proxy.nomadamas.org
-After=network-online.target k-skill-proxy.service
+After=network-online.target
 Wants=network-online.target
 # cloudflared, its config, and the app directory live on the gpu02:/data NFS
 # mount, so wait for it before attempting ExecStart at boot.
