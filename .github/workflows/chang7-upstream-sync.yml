@@ -1,9 +1,14 @@
 name: Chang7 upstream sync
+# GITHUB_TOKEN cannot modify workflow files. For those updates, configure
+# UPSTREAM_SYNC_TOKEN with Contents: write and Workflows: write,
+# restricted to the managed repositories.
+# A missing/underprivileged token is a failure, never a successful sync.
 on:
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '11 */6 * * *'
   workflow_dispatch:
   push:
+    branches: ['main']
     paths:
       - '.github/workflows/chang7-upstream-sync.yml'
 permissions:
@@ -13,18 +18,23 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sync:
-    if: github.repository_owner == 'Chang7'
+    if: github.repository_owner == 'Chang7' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Preserve user edits and merge upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          SYNC_TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
           EXPECTED_REPOSITORY_ID: '1317860582'
         run: |
           python3 - <<'PY'
           import json
           import os
+          import base64
+          import re
+          import subprocess
+          import tempfile
           from urllib.request import Request, build_opener, HTTPRedirectHandler
           from urllib.error import HTTPError
           from urllib.parse import quote
@@ -48,9 +58,96 @@ jobs:
                                      'Accept': 'application/vnd.github+json',
                                      'X-GitHub-Api-Version': '2026-03-10',
                                      'Content-Type': 'application/json'})
-              with build_opener(NoRedirect).open(req, timeout=30) as response:
-                  body = response.read()
-                  return json.loads(body) if body else {}
+              try:
+                  with build_opener(NoRedirect).open(req, timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body) if body else {}
+              except HTTPError as error:
+                  if error.code != 404:
+                      body = error.read(8192).decode('utf-8', errors='replace')
+                      body = body.replace(os.environ['GH_TOKEN'], '[REDACTED]')
+                      print(json.dumps({
+                          'status': 'API_ERROR', 'method': method, 'path': path,
+                          'http_status': error.code, 'response': body,
+                          'request_id': error.headers.get('X-GitHub-Request-Id'),
+                          'accepted_permissions': error.headers.get('X-Accepted-GitHub-Permissions'),
+                          'rate_limit_remaining': error.headers.get('X-RateLimit-Remaining'),
+                          'retry_after': error.headers.get('Retry-After')}), flush=True)
+                  raise
+          
+          def git(work, env, *args):
+              result = subprocess.run(['git', '-C', work, *args], env=env,
+                                      text=True, capture_output=True, timeout=180)
+              if result.returncode:
+                  detail = result.stderr + result.stdout
+                  header = env.get('GIT_CONFIG_VALUE_0', '')
+                  for secret in (env.get('GH_TOKEN'), header, header.removeprefix('AUTHORIZATION: basic ')):
+                      if secret:
+                          detail = detail.replace(secret, '[REDACTED]')
+                  raise RuntimeError('git ' + args[0] + ' failed: ' + detail[:8192])
+              return result.stdout.strip()
+          
+          def merge_candidate(work, before, source, env):
+              # Complete local Git comparisons avoid the REST compare 300-file limit.
+              base = git(work, env, 'merge-base', before, source)
+              changes = git(work, env, 'diff', '--no-renames', '--name-status', '-z', base, before)
+              if changes not in ('', 'A\0' + MANAGED + '\0'):
+                  raise RuntimeError('User changes detected; automatic sync stopped')
+              if git(work, env, 'ls-tree', source, '--', MANAGED):
+                  raise RuntimeError('Upstream uses managed workflow path; review required')
+              tree = git(work, env, 'merge-tree', '--write-tree', before, source).splitlines()[0]
+              if not re.fullmatch(r'[0-9a-f]{40}', tree):
+                  raise RuntimeError('Unexpected merge tree')
+              candidate = git(work, env, 'commit-tree', tree, '-p', before, '-p', source,
+                              '-m', 'chore(sync): merge upstream ' + source[:12])
+              git(work, env, 'merge-base', '--is-ancestor', before, candidate)
+              git(work, env, 'merge-base', '--is-ancestor', source, candidate)
+              if git(work, env, 'ls-tree', before, '--', MANAGED) != git(work, env, 'ls-tree', candidate, '--', MANAGED):
+                  raise RuntimeError('Managed workflow changed during merge')
+              delta = git(work, env, 'diff', '--no-renames', '--name-status', '-z', source, candidate)
+              if delta not in ('', 'A\0' + MANAGED + '\0'):
+                  raise RuntimeError('Unexpected merged content; refusing to push')
+              return candidate
+          
+          def require_workflow_token(work, before, candidate, env):
+              paths = git(work, env, 'diff', '--no-renames', '--name-only', '-z', before, candidate).split('\0')
+              workflows = [path for path in paths if path.startswith('.github/workflows/')]
+              if workflows and env.get('SYNC_TOKEN_CONFIGURED') != 'true':
+                  raise RuntimeError('BLOCKED_WORKFLOW_PERMISSION: GITHUB_TOKEN cannot update workflows. '
+                                     'Set the UPSTREAM_SYNC_TOKEN Actions secret to a token limited to this repository '
+                                     'with Contents: write and Workflows: write, then run this workflow again. '
+                                     'No push attempted. Affected files: ' + json.dumps(workflows))
+          
+          def native_merge(name, branch, before, source):
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', name):
+                  raise RuntimeError('Invalid repository name')
+              if not all(re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (before, source)):
+                  raise RuntimeError('Invalid pinned commit')
+              url = 'https://github.com/' + name + '.git'
+              auth = base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode()
+              env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1',
+                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_COUNT='2',
+                         GIT_CONFIG_KEY_0='http.' + url + '.extraheader',
+                         GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + auth,
+                         GIT_CONFIG_KEY_1='core.hooksPath', GIT_CONFIG_VALUE_1='/dev/null',
+                         GIT_AUTHOR_NAME='github-actions[bot]',
+                         GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com',
+                         GIT_COMMITTER_NAME='github-actions[bot]',
+                         GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com')
+              with tempfile.TemporaryDirectory() as work:
+                  git(work, env, 'init', '--bare', '-q')
+                  git(work, env, 'remote', 'add', 'origin', url)
+                  git(work, env, 'config', 'remote.origin.promisor', 'true')
+                  git(work, env, 'config', 'remote.origin.partialclonefilter', 'blob:none')
+                  git(work, env, 'fetch', '--no-tags', '--filter=blob:none', 'origin', before, source)
+                  candidate = merge_candidate(work, before, source, env)
+                  require_workflow_token(work, before, candidate, env)
+                  current = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
+                  if current != before:
+                      raise RuntimeError('Target moved during validation; retry from a fresh snapshot')
+                  # Never force. GitHub's normal permission and branch-policy checks apply.
+                  git(work, env, 'push', 'origin', candidate + ':refs/heads/' + branch)
+                  return {'sha': candidate}
           
           def main():
               name = os.environ['GITHUB_REPOSITORY']
@@ -77,16 +174,17 @@ jobs:
                       raise
               else:
                   raise RuntimeError('Upstream uses managed workflow path; review required')
-              # GitHub performs a non-destructive merge; conflicts and protections fail closed.
-              merged = request('POST', '/repos/' + name + '/merges', {
-                  'base': branch, 'head': source,
-                  'commit_message': 'chore(sync): merge upstream ' + source[:12]})
+              merged = native_merge(name, branch, before, source)
               after = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
               verify = request('GET', '/repos/' + name + '/compare/' + source + '...' + after)
               assert verify['behind_by'] == 0, 'Upstream is not included in target'
+              assert after == merged['sha'], 'Target moved after push; inspect current history'
+              preserved = request('GET', '/repos/' + name + '/compare/' + before + '...' + after)
+              assert preserved['behind_by'] == 0, 'Previous fork history is not included in target'
               print(json.dumps({'status': 'SYNCED', 'repo': name, 'before': before, 'upstream': source,
                                 'after': after, 'merge': merged.get('sha')}))
           
           if __name__ == '__main__':
               main()
           PY
+
