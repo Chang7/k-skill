@@ -43,7 +43,7 @@ npx -y @nomadamas/k-skill@0 update
 ## 협력사
 
 <p align="center">
-  <a href="https://www.bccard.com"><img src="docs/assets/bccard-logo.png" alt="BC카드" height="60"></a>&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.bccard.com"><img src="docs/assets/bccard-logo.png" alt="BC카드" width="242"></a>&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="docs/assets/heyumi-logo.png" alt="Heyumi" height="60">
 </p>
 
