@@ -18,6 +18,7 @@
 - **daangn-realty-search** — 당근부동산 지역 기반 매물 검색/상세
 - **gongsijiga-search** — 개별공시지가(원/㎡) 조회 (세금 산정용, 시세 아님)
 - **housing-official-price** — 공동주택 공시가격 조회
+- **housing-subscription-reference** — 민영주택 청약가점·청약 예치금 기준 조회 (주택공급에 관한 규칙 별표 1·2)
 - **building-register-search** — 건축물대장 표제부 조회 (주소·PNU 기준)
 - **court-auction-notice-search** — 대법원경매정보 부동산 매각공고·사건 조회
 - **daangn-cars-search** — 당근중고차 지역·가격 조건 차량 검색/상세
